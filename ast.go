@@ -5,17 +5,19 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"reflect"
+	"slices"
 )
 
-type Action func(m *StateMachine, input map[string]any) error
+type Action func(m *StateMachine, input map[string]Value) error
 
 type Statement interface {
-	CheckType(map[string]Value, *Registry) error
-	Execute(*Registry) Action
+	CheckType(map[string]Value, *CompiledMachine) error
+	Execute(*CompiledMachine) Action
 }
 
 type Entry interface {
-	EvalToplevel(*CompiledMachine, *Registry) error
+	EvalToplevel(*CompiledMachine) error
 }
 
 type File struct {
@@ -28,14 +30,14 @@ type State struct {
 	Triggers []Trigger
 }
 
-func (trg *Trigger) evalTrigger(state string, index int, m *CompiledMachine, reg *Registry) (CompiledTrigger, error) {
+func (trg *Trigger) evalTrigger(state string, index int, m *CompiledMachine) (CompiledTrigger, error) {
 	var out CompiledTrigger
 
-	out.datatypes = make(map[string]ValueType)
+	datatypes := make(map[string]reflect.Type)
 	local := maps.Clone(m.constants)
 
 	for condidx, c := range trg.Cond {
-		spec, ok := reg.Triggers[c.Name]
+		spec, ok := m.reg.triggers[c.Name]
 		if !ok {
 			return out, fmt.Errorf("in trigger %s#%d: unspecified trigger %q", state, index, c.Name)
 		}
@@ -46,22 +48,22 @@ func (trg *Trigger) evalTrigger(state string, index int, m *CompiledMachine, reg
 		}
 
 		prevkeys := make(map[string]bool)
-		for name := range out.datatypes {
+		for name := range datatypes {
 			prevkeys[name] = false
 		}
 		for _, param := range c.Params {
-			argtype, ok := spec.Outputs[param.Key]
-			if !ok {
+			i := getTypeField(spec, param.Key)
+			if i == -1 {
 				return out, fmt.Errorf("in trigger %s#%d: unspecified event-data %q for trigger %s", state, index, param.Key, c.Name)
 			}
+			argtype := spec.Field(i).Type
 			if param.Value != nil {
-				fmt.Printf("[%s] %v\n", param.Key, param.Value)
 				condtype, err := param.Value.EvalType(m.constants)
 				if err != nil {
 					return out, fmt.Errorf("in trigger %s#%d: cannot determine type of variable for event-data %q: %w", state, index, param.Key, err)
 				}
 				if condtype != argtype {
-					return out, fmt.Errorf("in trigger %s#%d: type mismatch for event-data %q: expected %v, got %v", state, index, param.Key, argtype, condtype)
+					return out, fmt.Errorf("in trigger %s#%d: type mismatch for event-data %q: expected %v, got %v", state, index, param.Key, argtype.Name(), condtype.Name())
 				}
 				cond.Value[param.Key], err = param.Value.EvalValue(m.constants)
 				if err != nil {
@@ -69,12 +71,12 @@ func (trg *Trigger) evalTrigger(state string, index int, m *CompiledMachine, reg
 				}
 			}
 			prevkeys[param.Key] = true
-			if prevtype, ok := out.datatypes[param.Key]; ok {
+			if prevtype, ok := datatypes[param.Key]; ok {
 				if prevtype != argtype {
 					return out, fmt.Errorf("in trigger %s#%d: type mismatch for event-data %q: unable to redefine to %v (previously %v)", state, index, param.Key, argtype, prevtype)
 				}
 			} else {
-				out.datatypes[param.Key] = argtype
+				datatypes[param.Key] = argtype
 				local[param.Key] = &TypeDummyValue{argtype}
 			}
 		}
@@ -83,31 +85,31 @@ func (trg *Trigger) evalTrigger(state string, index int, m *CompiledMachine, reg
 				continue
 			}
 			log.Printf("in trigger %s#%d: dropping previous event-data %q: not mentioned in condition #%d\n", state, index, name, condidx)
-			delete(out.datatypes, name)
+			delete(datatypes, name)
 			delete(local, name)
 		}
 		out.cond = append(out.cond, cond)
 	}
-	fmt.Printf("in trigger %s#%d: types %+v\n", state, index, out.datatypes)
 	for _, stmt := range trg.Actions {
-		if err := stmt.CheckType(local, reg); err != nil {
+		if err := stmt.CheckType(local, m); err != nil {
 			return out, err
 		}
-		out.actions = append(out.actions, stmt.Execute(reg))
+		out.actions = append(out.actions, stmt.Execute(m))
 	}
+	out.datatypes = slices.Collect(maps.Keys(datatypes))
 	return out, nil
 }
 
-func (st *State) EvalToplevel(m *CompiledMachine, reg *Registry) error {
+func (st *State) EvalToplevel(m *CompiledMachine) error {
 	var outstate CompiledState
 	for _, stmt := range st.Init {
-		if err := stmt.CheckType(m.constants, reg); err != nil {
+		if err := stmt.CheckType(m.constants, m); err != nil {
 			return err
 		}
-		outstate.Init = append(outstate.Init, stmt.Execute(reg))
+		outstate.Init = append(outstate.Init, stmt.Execute(m))
 	}
 	for i, trg := range st.Triggers {
-		ctrg, err := trg.evalTrigger(st.Name, i, m, reg)
+		ctrg, err := trg.evalTrigger(st.Name, i, m)
 		if err != nil {
 			return err
 		}
@@ -125,7 +127,7 @@ type SetStmt struct {
 	Value Value
 }
 
-func (ss *SetStmt) EvalToplevel(m *CompiledMachine, reg *Registry) error {
+func (ss *SetStmt) EvalToplevel(m *CompiledMachine) error {
 	m.constants[ss.Key] = ss.Value
 	return nil
 }
@@ -134,12 +136,12 @@ type MoveStmt struct {
 	Dest string
 }
 
-func (ms *MoveStmt) CheckType(_ map[string]Value, reg *Registry) error {
+func (ms *MoveStmt) CheckType(_ map[string]Value, m *CompiledMachine) error {
 	return nil
 }
 
-func (ms *MoveStmt) Execute(*Registry) Action {
-	return func(m *StateMachine, input map[string]any) error {
+func (ms *MoveStmt) Execute(*CompiledMachine) Action {
+	return func(m *StateMachine, input map[string]Value) error {
 		return m.move(ms.Dest)
 	}
 }
@@ -156,34 +158,55 @@ type Trigger struct {
 
 type Call struct {
 	Name string
-	Args []Arg
+	Args map[string]Value
 }
 
-func (c *Call) CheckType(ctx map[string]Value, reg *Registry) error {
-	spec, ok := reg.Actions[c.Name]
+func (c *Call) CheckType(ctx map[string]Value, m *CompiledMachine) error {
+	spec, ok := m.reg.actions[c.Name]
 	if !ok {
 		return fmt.Errorf("unspecified action %q", c.Name)
 	}
-	for _, param := range c.Args {
-		argtype, ok := spec.Inputs[param.Key]
-		if !ok {
-			return fmt.Errorf("unspecified argument %q for action %s", param.Key, c.Name)
+	for key, value := range c.Args {
+		i := slices.Index(spec.Inputs, key)
+		if i == -1 {
+			return fmt.Errorf("unspecified argument %q for action %s", key, c.Name)
 		}
-		valuetype, err := param.Value.EvalType(ctx)
+		argtype := spec.Function.Type().In(i)
+		valuetype, err := value.EvalType(ctx)
 		if err != nil {
-			return fmt.Errorf("cannot determine type of variable for argument %q: %w", param.Key, err)
+			return fmt.Errorf("cannot determine type of variable for argument %q: %w", key, err)
 		}
-		if valuetype != argtype {
-			return fmt.Errorf("type mismatch for argument %s.%s: expected %v, got %v", c.Name, param.Key, argtype, valuetype)
+		if !valuetype.ConvertibleTo(argtype) && reflect.PointerTo(valuetype).ConvertibleTo(argtype) {
+			return fmt.Errorf("type mismatch for argument %s.%s: expected %v, got %v", c.Name, key, argtype, valuetype)
 		}
 	}
 	return nil
 }
 
-func (c *Call) Execute(reg *Registry) Action {
-	spec := reg.Actions[c.Name]
-	return func(m *StateMachine, ctx map[string]any) error {
-		spec.Function(ctx)
+func (c *Call) Execute(m *CompiledMachine) Action {
+	spec := m.reg.actions[c.Name]
+	return func(m *StateMachine, ctx map[string]Value) error {
+		ins := make([]reflect.Value, len(spec.Inputs))
+		for i, name := range spec.Inputs {
+			argtype := spec.Function.Type().In(i)
+			v, ok := c.Args[name]
+			if ok {
+				eval, err := v.EvalValue(ctx)
+				if err != nil {
+					return err
+				}
+				if evt := reflect.ValueOf(eval); evt.CanConvert(argtype) {
+					ins[i] = evt.Convert(argtype)
+				} else if evt := reflect.ValueOf(&eval); evt.CanConvert(argtype) {
+					ins[i] = evt.Convert(argtype)
+				} else {
+					return fmt.Errorf("unable to convert argument %s.%s from %v to %v", c.Name, name, reflect.TypeOf(eval), argtype)
+				}
+			} else {
+				ins[i] = reflect.Zero(spec.Function.Type().In(i))
+			}
+		}
+		spec.Function.Call(ins)
 		return nil
 	}
 }
@@ -193,95 +216,21 @@ type Arg struct {
 	Value Value
 }
 
-type ValueType int
-
-const (
-	ValueString ValueType = iota
-	ValueInt
-	ValueFloat
-	ValueBool
-	ValueConstant
-)
-
-func (i ValueType) String() string {
-	switch i {
-	case ValueString:
-		return "string"
-	case ValueInt:
-		return "integer"
-	case ValueFloat:
-		return "float"
-	case ValueBool:
-		return "boolean"
-	case ValueConstant:
-		return "untyped-constant"
-	}
-	return fmt.Sprintf("ValueType(%d)", i)
-}
-
 type Value interface {
 	EvalValue(ctx map[string]Value) (any, error)
-	EvalType(ctx map[string]Value) (ValueType, error)
+	EvalType(ctx map[string]Value) (reflect.Type, error)
 }
 
-type StringValue struct {
-	Value string
-}
-
-func (v *StringValue) EvalValue(ctx map[string]Value) (any, error) {
-	return v.Value, nil
-}
-
-func (v *StringValue) EvalType(ctx map[string]Value) (ValueType, error) {
-	return ValueString, nil
-}
-
-type IntValue struct {
-	Value int64
-}
-
-func (v *IntValue) EvalValue(ctx map[string]Value) (any, error) {
-	return v.Value, nil
-}
-
-func (v *IntValue) EvalType(ctx map[string]Value) (ValueType, error) {
-	return ValueInt, nil
-}
-
-type FloatValue struct {
-	Value float64
-}
-
-func (v *FloatValue) EvalValue(ctx map[string]Value) (any, error) {
-	return v.Value, nil
-}
-
-func (v *FloatValue) EvalType(ctx map[string]Value) (ValueType, error) {
-	return ValueFloat, nil
-}
-
-type BoolValue struct {
-	Value bool
-}
-
-func (v *BoolValue) EvalValue(ctx map[string]Value) (any, error) {
-	return v.Value, nil
-}
-
-func (v *BoolValue) EvalType(ctx map[string]Value) (ValueType, error) {
-	return ValueBool, nil
-}
-
-type ConstantValue struct {
+type ConstValue struct {
 	Value any
 }
 
-func (v *ConstantValue) EvalValue(ctx map[string]Value) (any, error) {
+func (v *ConstValue) EvalValue(ctx map[string]Value) (any, error) {
 	return v.Value, nil
 }
 
-func (v *ConstantValue) EvalType(ctx map[string]Value) (ValueType, error) {
-	return ValueConstant, nil
+func (v *ConstValue) EvalType(ctx map[string]Value) (reflect.Type, error) {
+	return reflect.TypeOf(v.Value), nil
 }
 
 type ReferenceValue struct {
@@ -296,10 +245,10 @@ func (v *ReferenceValue) EvalValue(ctx map[string]Value) (any, error) {
 	return ref.EvalValue(ctx)
 }
 
-func (v *ReferenceValue) EvalType(ctx map[string]Value) (ValueType, error) {
+func (v *ReferenceValue) EvalType(ctx map[string]Value) (reflect.Type, error) {
 	ref, ok := ctx[v.Ref]
 	if !ok {
-		return 0, fmt.Errorf("undefined variable %q", v.Ref)
+		return nil, fmt.Errorf("undefined variable %q", v.Ref)
 	}
 	return ref.EvalType(ctx)
 }
@@ -307,13 +256,13 @@ func (v *ReferenceValue) EvalType(ctx map[string]Value) (ValueType, error) {
 var ErrDummyNotEvaluable = errors.New("Dummy Value not evaluable.")
 
 type TypeDummyValue struct {
-	typ ValueType
+	typ reflect.Type
 }
 
 func (v *TypeDummyValue) EvalValue(ctx map[string]Value) (any, error) {
 	return nil, ErrDummyNotEvaluable
 }
 
-func (v *TypeDummyValue) EvalType(ctx map[string]Value) (ValueType, error) {
+func (v *TypeDummyValue) EvalType(ctx map[string]Value) (reflect.Type, error) {
 	return v.typ, nil
 }

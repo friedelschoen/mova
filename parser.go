@@ -2,13 +2,12 @@ package mova
 
 import (
 	"fmt"
-	"io"
 	"regexp"
 	"strconv"
 	"strings"
 )
 
-var dslRules = []Rule{
+var rules = []rule{
 	{"", regexp.MustCompile(`^[\s\t\r\n]+`)}, // whitespace
 	{"", regexp.MustCompile(`^#[^\n]*`)},     // comment
 
@@ -22,16 +21,12 @@ var dslRules = []Rule{
 	{"identifier", regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*`)},
 }
 
-type Parser struct {
-	*Lexer
+type parser struct {
+	*lexer
 	filename string
 }
 
-func NewParser(filename string, r io.Reader) *Parser {
-	return &Parser{Lexer: NewLexer(r, dslRules), filename: filename}
-}
-
-func (p *Parser) expect(name string) string {
+func (p *parser) expect(name string) string {
 	if p.Token != name {
 		p.errUnexpected(name)
 	}
@@ -40,7 +35,7 @@ func (p *Parser) expect(name string) string {
 	return v
 }
 
-func (p *Parser) expectValue(val string) {
+func (p *parser) expectValue(val string) {
 	if p.Value != val {
 		p.errUnexpected(strconv.Quote(val))
 	}
@@ -73,7 +68,7 @@ func (perr *ParseError) Error() string {
 	return fmt.Sprintf("%s:%d:%d-%d: expected %s, got %q", perr.Filename, perr.Line, perr.Offset, perr.Offset+perr.Length, exp.String(), perr.Value)
 }
 
-func (p *Parser) errUnexpected(expected ...string) {
+func (p *parser) errUnexpected(expected ...string) {
 	err := &ParseError{
 		Filename: p.filename,
 		Expected: expected,
@@ -87,7 +82,7 @@ func (p *Parser) errUnexpected(expected ...string) {
 }
 
 // entry point
-func (p *Parser) ParseFile() (f *File, err error) {
+func (p *parser) ParseFile() (f *File, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if e, ok := r.(error); ok {
@@ -107,7 +102,7 @@ func (p *Parser) ParseFile() (f *File, err error) {
 	return f, nil
 }
 
-func (p *Parser) parseEntry() Entry {
+func (p *parser) parseEntry() Entry {
 	if p.Value == "state" {
 		st := p.parseState()
 		p.expectValue(";")
@@ -124,7 +119,7 @@ func (p *Parser) parseEntry() Entry {
 	return nil
 }
 
-func (p *Parser) parseState() *State {
+func (p *parser) parseState() *State {
 	p.expectValue("state")
 	name := p.expect("identifier")
 	p.expectValue("{")
@@ -145,7 +140,7 @@ func (p *Parser) parseState() *State {
 	return &State{Name: name, Init: init, Triggers: triggers}
 }
 
-func (p *Parser) parseTriggerCond() TriggerCond {
+func (p *parser) parseTriggerCond() TriggerCond {
 	name := p.expect("identifier")
 	var params []Arg
 	if p.Value == "(" {
@@ -162,7 +157,7 @@ func (p *Parser) parseTriggerCond() TriggerCond {
 	return TriggerCond{name, params}
 }
 
-func (p *Parser) parseTrigger() Trigger {
+func (p *parser) parseTrigger() Trigger {
 	p.expectValue("on")
 	var conds []TriggerCond
 	conds = append(conds, p.parseTriggerCond())
@@ -180,7 +175,7 @@ func (p *Parser) parseTrigger() Trigger {
 	return Trigger{Cond: conds, Actions: actions}
 }
 
-func (p *Parser) parseAction() Statement {
+func (p *parser) parseAction() Statement {
 	// move <state>
 	if p.Value == "move" {
 		p.Next()
@@ -195,13 +190,14 @@ func (p *Parser) parseAction() Statement {
 	return nil
 }
 
-func (p *Parser) parseCall() *Call {
+func (p *parser) parseCall() *Call {
 	name := p.expect("identifier")
-	var args []Arg
+	args := make(map[string]Value)
 	if p.Value == "(" {
 		p.Next()
 		for p.Value != ")" {
-			args = append(args, p.parseArg())
+			key, value := p.parseArg()
+			args[key] = value
 			if p.Value != "," {
 				break
 			}
@@ -212,7 +208,7 @@ func (p *Parser) parseCall() *Call {
 	return &Call{Name: name, Args: args}
 }
 
-func (p *Parser) parseParam() Arg {
+func (p *parser) parseParam() Arg {
 	key := p.expect("identifier")
 	if p.Value == "=" {
 		p.Next()
@@ -221,16 +217,16 @@ func (p *Parser) parseParam() Arg {
 	return Arg{Key: key}
 }
 
-func (p *Parser) parseArg() Arg {
+func (p *parser) parseArg() (string, Value) {
 	key := p.expect("identifier")
 	if p.Value == "=" {
 		p.Next()
-		return Arg{Key: key, Value: p.parseValue()}
+		return key, p.parseValue()
 	}
-	return Arg{Key: key, Value: &ReferenceValue{Ref: key}}
+	return key, &ReferenceValue{Ref: key}
 }
 
-func (p *Parser) parseValue() Value {
+func (p *parser) parseValue() Value {
 	switch p.Token {
 	case "string":
 		raw := p.Value
@@ -238,9 +234,17 @@ func (p *Parser) parseValue() Value {
 		s := strings.NewReplacer(
 			"\\\"", "\"",
 			"\\'", "'",
-		// TODO: \n \t \v \f ...
+			"\\a", "\a",
+			"\\b", "\b",
+			"\\e", "\033",
+			"\\f", "\f",
+			"\\n", "\n",
+			"\\r", "\r",
+			"\\t", "\t",
+			"\\v", "\v",
+			"\\\\", "\\",
 		).Replace(raw[1 : len(raw)-1])
-		return &StringValue{s}
+		return &ConstValue{s}
 	case "int":
 		s := p.Value
 		p.Next()
@@ -248,7 +252,7 @@ func (p *Parser) parseValue() Value {
 		if err != nil {
 			panic(err)
 		}
-		return &IntValue{i}
+		return &ConstValue{i}
 	case "float":
 		s := p.Value
 		p.Next()
@@ -256,17 +260,17 @@ func (p *Parser) parseValue() Value {
 		if err != nil {
 			panic(err)
 		}
-		return &FloatValue{f}
+		return &ConstValue{f}
 	case "bool":
 		s := p.Value
 		p.Next()
-		return &BoolValue{s == "true"}
+		return &ConstValue{s == "true"}
 	case "identifier":
 		s := p.Value
 		p.Next()
 		return &ReferenceValue{Ref: s}
 	default:
-		p.errUnexpected("string", "int", "float", "identifier")
+		p.errUnexpected("string", "int", "float", "bool", "identifier")
 		return nil
 	}
 }

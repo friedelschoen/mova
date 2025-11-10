@@ -8,14 +8,14 @@ import (
 	"unicode/utf8"
 )
 
-type Rule struct {
+type rule struct {
 	Name    string
 	Pattern *regexp.Regexp
 }
 
-type Lexer struct {
+type lexer struct {
 	reader *bufio.Reader
-	rules  []Rule
+	rules  []rule
 
 	text     []byte
 	linesize int
@@ -28,8 +28,8 @@ type Lexer struct {
 	Err    error
 }
 
-func NewLexer(reader io.Reader, rules []Rule) *Lexer {
-	var lex Lexer
+func newLexer(reader io.Reader, rules []rule) *lexer {
+	var lex lexer
 	lex.reader = bufio.NewReader(reader)
 	lex.rules = rules
 	lex.Linenr = 1
@@ -38,7 +38,38 @@ func NewLexer(reader io.Reader, rules []Rule) *Lexer {
 	return &lex
 }
 
-func (tz *Lexer) Next() {
+func (tz *lexer) move(n int) {
+	tz.text = tz.text[n:]
+	tz.Offset += n
+}
+
+func (tz *lexer) makeToken(typ string, n int) {
+	tz.Token = typ
+	tz.Length = n
+	tz.Value = string(tz.text[:n])
+}
+
+func (tz *lexer) readLine() error {
+	tz.Linenr += tz.linesize
+	tz.Offset = 0
+	tz.linesize = 0
+
+	var buf []byte
+	for {
+		tz.linesize++
+		line, err := tz.reader.ReadBytes('\n')
+		if err != nil {
+			return err
+		}
+		if line[len(line)-1] != '\\' {
+			tz.text = append(buf, line...)
+			return nil
+		}
+		buf = append(buf, line[:len(line)-1]...)
+	}
+}
+
+func (tz *lexer) Next() {
 	// move forward
 	tz.move(tz.Length)
 
@@ -68,36 +99,5 @@ tokenLoop:
 		_, sz := utf8.DecodeRune(tz.text)
 		tz.makeToken("ILLEGAL", sz)
 		return
-	}
-}
-
-func (tz *Lexer) move(n int) {
-	tz.text = tz.text[n:]
-	tz.Offset += n
-}
-
-func (tz *Lexer) makeToken(typ string, n int) {
-	tz.Token = typ
-	tz.Length = n
-	tz.Value = string(tz.text[:n])
-}
-
-func (tz *Lexer) readLine() error {
-	tz.Linenr += tz.linesize
-	tz.Offset = 0
-	tz.linesize = 0
-
-	var buf []byte
-	for {
-		tz.linesize++
-		line, err := tz.reader.ReadBytes('\n')
-		if err != nil {
-			return err
-		}
-		if line[len(line)-1] != '\\' {
-			tz.text = append(buf, line...)
-			return nil
-		}
-		buf = append(buf, line[:len(line)-1]...)
 	}
 }
